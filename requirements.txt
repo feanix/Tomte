@@ -1,0 +1,5 @@
+numpy
+Pillow
+PySide6
+# optional: reads 16-bit colour PNG/TIFF at full precision
+opencv-python-headless

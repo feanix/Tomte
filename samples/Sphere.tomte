@@ -1,0 +1,24 @@
+{
+  "tomte_setup": 1,
+  "source": "Sphere_OriginalUVs.fbx",
+  "target": "Sphere_NewUVs.fbx",
+  "output": null,
+  "uv_channel": 0,
+  "textures": [
+    {
+      "path": "Sphere_Basecolor.png",
+      "type": "srgb"
+    },
+    {
+      "path": "Sphere_Normal.png",
+      "type": "normal"
+    }
+  ],
+  "options": {
+    "size": 0,
+    "supersample": 2,
+    "pad": 16,
+    "normal_convention": "auto",
+    "sixteen_bit": false
+  }
+}
