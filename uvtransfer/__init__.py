@@ -21,7 +21,7 @@ from .system import available_memory, default_workers
 from .transfer import (KIND_LABELS, KINDS, Options, Result, Transfer, classify,
                        default_output_dir, estimate_memory, output_name, output_size)
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 __all__ = [
     "Cancelled", "TransferError", "IMAGE_EXTENSIONS", "image_info", "load_image", "save_image",

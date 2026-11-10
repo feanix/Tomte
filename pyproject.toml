@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "uvtransfer"
-version = "1.0.0"
+version = "1.0.1"
 description = "Tomte: move textures (including tangent-space normal maps) between two UV layouts of the same mesh"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,7 +28,10 @@ Homepage = "https://github.com/feanix/Tomte"
 Issues = "https://github.com/feanix/Tomte/issues"
 
 [project.optional-dependencies]
-gui = ["PySide6"]
+gui = [                                  # PySide6 6.12.0 crashes on Python 3.10 and 3.11
+    "PySide6; python_version >= '3.12'",
+    "PySide6 < 6.12; python_version < '3.12'",
+]
 precision = ["opencv-python-headless"]   # full-precision 16-bit colour PNG/TIFF input
 
 [project.scripts]

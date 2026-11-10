@@ -1,5 +1,7 @@
 numpy
 Pillow
-PySide6
+PySide6; python_version >= "3.12"
+# PySide6 6.12.0 crashes on Python 3.10 and 3.11
+PySide6 < 6.12; python_version < "3.12"
 # optional: reads 16-bit colour PNG/TIFF at full precision
 opencv-python-headless

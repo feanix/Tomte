@@ -4,10 +4,27 @@ import os
 import sys
 import traceback
 
+import PySide6
+from PySide6.QtCore import QObject
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication, QMessageBox, QStyleFactory
 
 from .main_window import APP_NAME, MainWindow
+
+
+PYSIDE_FIX = 'python -m pip install "PySide6<6.12"'
+
+
+def pyside_drops_none():
+    """True if PySide6 has the bug (6.12.0 on Python 3.10 and 3.11) where every call that
+    returns nothing loses a reference to None, so Python crashes after a while."""
+    if sys.version_info >= (3, 12):
+        return False                      # None can't be freed from Python 3.12 on
+    probe = QObject()
+    before = sys.getrefcount(None)
+    for _ in range(20):
+        probe.setObjectName("probe")
+    return sys.getrefcount(None) < before - 10
 
 
 def apply_dark_theme(app):
@@ -33,6 +50,14 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     app = QApplication.instance() or QApplication([sys.argv[0]])
     app.setApplicationName(APP_NAME)
+    if pyside_drops_none():
+        python = ".".join(map(str, sys.version_info[:2]))
+        text = (f"PySide6 {PySide6.__version__} has a bug on Python {python} that would make {APP_NAME} "
+                f"crash. Fix it by running:\n\n    {PYSIDE_FIX}\n\nor use Python 3.12 or later.")
+        if sys.__stderr__:
+            sys.__stderr__.write(text + "\n")
+        QMessageBox.critical(None, APP_NAME, text)
+        return 1
     apply_dark_theme(app)
     window = MainWindow(paths=[os.path.abspath(a) for a in argv])
 

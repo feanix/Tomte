@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.1
+
+- Fixed: the desktop app could crash on Python 3.10 and 3.11 with PySide6
+  6.12.0, because of a bug in that PySide6 release. On those Python versions
+  the requirements now install an earlier PySide6, and the app explains how
+  to fix an install that already has 6.12.0.
+
 ## 1.0.0 (first public release)
 
 - Desktop app (`Tomte.bat` or `python -m uvtransfer.gui`): pick two FBX files,
