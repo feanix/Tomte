@@ -65,7 +65,7 @@ def detect_convention(nmap, mask):
     return "dx", "Normal format couldn't be detected; assumed DirectX (Unreal)"
 
 
-def reorient(rgb, bary, src_frames, src_corners, dst_frames, dst_corners, directx):
+def reorient(rgb, bary, src_frames, src_corners, dst_frames, dst_corners, directx, directx_out=None):
     """Re-express encoded tangent-space normals from source frames in target frames.
 
     Each sample lies inside one triangle; its frame is the barycentric blend of
@@ -77,6 +77,7 @@ def reorient(rgb, bary, src_frames, src_corners, dst_frames, dst_corners, direct
         src_frames, dst_frames: (T, B, N) per-corner frames of each mesh.
         src_corners, dst_corners: (n, 3) corner indices of each sample's triangle.
         directx: True if the texture uses the DirectX (green-down) convention.
+        directx_out: convention of the result; None keeps the texture's.
 
     Returns:
         (n, 3) float32 unit normals in -1..1 (not yet encoded).
@@ -102,5 +103,7 @@ def reorient(rgb, bary, src_frames, src_corners, dst_frames, dst_corners, direct
     nt[degenerate] = n[degenerate]                # no usable frame: keep the normal as it was
     nt /= np.maximum(np.linalg.norm(nt, axis=1, keepdims=True), 1e-20)
     if directx:
+        nt[:, 1] = -nt[:, 1]                      # back to the texture's convention
+    if directx_out is not None and directx_out != directx:
         nt[:, 1] = -nt[:, 1]
     return nt.astype(np.float32)

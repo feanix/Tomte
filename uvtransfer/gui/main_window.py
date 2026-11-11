@@ -7,20 +7,22 @@ import threading
 import time
 
 from PySide6.QtCore import QSettings, Qt, QTimer, QUrl
-from PySide6.QtGui import QAction, QDesktopServices, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QApplication, QCheckBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
-                               QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox,
-                               QSplitter, QTableWidgetItem, QVBoxLayout, QWidget, QComboBox,
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QFormLayout, QGroupBox, QHBoxLayout,
+                               QLabel, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
+                               QSpinBox, QSplitter, QTableWidgetItem, QVBoxLayout, QWidget, QComboBox,
                                QFileDialog)
 
 from ..errors import TransferError
 from ..images import IMAGE_EXTENSIONS, image_info
 from ..setupfile import EXTENSION as SETUP_EXTENSION, Setup, TextureEntry
 from ..system import available_memory
-from ..transfer import Options, classify, default_output_dir, estimate_memory
+from ..tiles import describe as describe_tiles
+from ..transfer import Options, check_map_name, classify, default_output_dir, estimate_memory
+from . import placement
 from .preview import PreviewCache
-from .rows import Status, TextureRow
-from .widgets import (GREY, FileField, ImageView, NoWheelComboBox, StatusCell, TextureTable,
+from .rows import PLAIN, Status, TextureRow, TileTexture
+from .widgets import (GREY, FileField, FillButton, ImageView, NoWheelComboBox, StatusCell, TextureTable,
                       is_fbx, is_image, local_paths)
 from .worker import Bridge, Job, TransferWorker, load_meshes
 
@@ -39,6 +41,9 @@ CONVENTION_CHOICES = [("Auto-detect", "auto"), ("DirectX (Unreal)", "dx"),
 IMAGE_FILTER = "Images (" + " ".join("*" + e for e in IMAGE_EXTENSIONS) + ")"
 SETUP_FILTER = f"Tomte setups (*{SETUP_EXTENSION})"
 CLI_SCRIPT = "tomte_cli.py"    # next to the uvtransfer package in a downloaded copy
+PLAIN_HINT = "Types are guessed from file names; change them if needed."
+TILED_HINT = ("Each row is one output. Drop textures onto a tile's column; double-click a name to "
+              "rename it.")
 
 GREEN, AMBER, RED = "#6cc070", "#e0b050", "#e06060"
 MESH_RELOAD_DELAY_MS = 300   # wait for typing to pause before re-reading the FBX files
@@ -117,6 +122,8 @@ class MainWindow(QMainWindow):
         self.next_row_id = 1
         self.preview_request = 0
         self.out_auto = True          # output folder follows the target FBX
+        self.src_wireframe = None     # source UVs, all of them
+        self.tile_wireframes = {}     # tile -> source UVs in that tile, moved into 0 to 1
 
         self._build_ui()
         self._connect_signals()
@@ -141,6 +148,25 @@ class MainWindow(QMainWindow):
 
     def warn(self, text):
         QMessageBox.warning(self, APP_NAME, text)
+
+    def pick_colour(self, initial):
+        """Colour dialog. Returns a tuple of 0..1 values (RGB, or RGBA if not opaque), or None if cancelled."""
+        start = QColor.fromRgbF(*(list(initial[:3]) + [initial[3] if len(initial) > 3 else 1.0])) \
+            if initial and len(initial) >= 3 else QColor(128, 128, 128)
+        colour = QColorDialog.getColor(start, self, "Fill colour",
+                                       QColorDialog.ColorDialogOption.ShowAlphaChannel)
+        if not colour.isValid():
+            return None
+        values = [round(c / 255, 3) for c in (colour.red(), colour.green(), colour.blue(), colour.alpha())]
+        return tuple(values if values[3] < 1 else values[:3])
+
+    def pick_texture(self, title):
+        """File dialog for one image. Returns its path, or "" if cancelled."""
+        start = self.settings.value("last_tex_dir", "") or os.path.dirname(self.src_field.path())
+        path, _ = QFileDialog.getOpenFileName(self, title, start, IMAGE_FILTER)
+        if path:
+            self.settings.setValue("last_tex_dir", os.path.dirname(path))
+        return path
 
     def inform(self, text):
         QMessageBox.information(self, APP_NAME, text)
@@ -222,13 +248,14 @@ class MainWindow(QMainWindow):
         self.add_btn = QPushButton("Add…")
         self.remove_btn = QPushButton("Remove")
         self.clear_btn = QPushButton("Clear")
-        hint = QLabel("Types are guessed from file names; change them if needed.")
-        hint.setStyleSheet(f"color: {GREY}")
+        self.texture_hint = QLabel(PLAIN_HINT)
+        self.texture_hint.setStyleSheet(f"color: {GREY}")
+        self.texture_hint.setWordWrap(True)
         buttons = QHBoxLayout()
         for b in (self.add_btn, self.remove_btn, self.clear_btn):
             buttons.addWidget(b)
         buttons.addStretch(1)
-        buttons.addWidget(hint)
+        buttons.addWidget(self.texture_hint)
         box = QGroupBox("Textures")
         layout = QVBoxLayout(box)
         layout.addWidget(self.table, 1)
@@ -349,9 +376,13 @@ class MainWindow(QMainWindow):
         self.add_btn.clicked.connect(self._browse_textures)
         self.remove_btn.clicked.connect(self._remove_selected)
         self.clear_btn.clicked.connect(self._clear_textures)
-        self.table.filesDropped.connect(self.add_textures)
+        self.table.filesDropped.connect(self._files_dropped)
         self.table.itemSelectionChanged.connect(self._refresh_preview)
         self.table.itemSelectionChanged.connect(self._update_enabled)
+        self.table.itemChanged.connect(self._item_changed)
+        self.table.cellDoubleClicked.connect(self._cell_double_clicked)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._table_menu)
         self.delete_shortcut = QShortcut(QKeySequence(QKeySequence.StandardKey.Delete), self.table)
         self.delete_shortcut.activated.connect(self._remove_selected)
 
@@ -501,15 +532,35 @@ class MainWindow(QMainWindow):
             self.log(f"Meshes loaded: {load.transfer.summary()}")
             for w in load.transfer.warnings:
                 self.log(w, AMBER)
+        self.tile_wireframes = load.tile_wireframes or {}
         self._set_wireframes(load.src_wireframe, load.dst_wireframe)
+        if load.transfer is not None:
+            self._apply_mesh_tiles(load.transfer.tiles)
         self._update_enabled()
         if self.run_after_load and load.transfer is not None:
             self.run_after_load = False
             self.start()
 
     def _set_wireframes(self, src, dst):
+        self.src_wireframe = src
         self.before_view.set_wireframe(src)
         self.after_view.set_wireframe(dst)
+
+    def _apply_mesh_tiles(self, mesh_tiles):
+        """Show a column per tile when the source mesh uses several, else the plain list.
+
+        The list only goes back to plain when no row would lose anything
+        (several textures, a fill or a chosen name).
+        """
+        used = {t for r in self.rows.values() if r.tiled for t in r.textures}
+        keep = any(r.tiled and not r.is_plain_equivalent() for r in self.rows.values())
+        tiles = sorted(set(mesh_tiles) | used) if len(mesh_tiles) > 1 or keep else []
+        if tiles == self.table.tiles:
+            return
+        if tiles and not self.table.tiles:
+            self.log(f"The source mesh uses tiles {describe_tiles(tiles)}: each output can take a texture "
+                     "per tile.")
+        self._convert_rows(tiles)
 
     # -- output folder ------------------------------------------------------------
 
@@ -531,68 +582,190 @@ class MainWindow(QMainWindow):
 
     # -- texture list -------------------------------------------------------------
 
+    @property
+    def tiled(self):
+        """True when the list shows outputs put together from a texture per UDIM tile."""
+        return bool(self.table.tiles)
+
     def _browse_textures(self):
         start = self.settings.value("last_tex_dir", "") or os.path.dirname(self.src_field.path())
         paths, _ = QFileDialog.getOpenFileNames(self, "Add textures", start, IMAGE_FILTER)
         if paths:
             self.settings.setValue("last_tex_dir", os.path.dirname(paths[0]))
-            self.add_textures(paths)
+            self.add_textures(paths, tile=self._current_tile())
 
-    def add_textures(self, paths):
-        """Add image files to the list (duplicates and unreadable files are skipped)."""
+    def _current_tile(self):
+        """The tile of the current cell's column, if it is a tile column."""
+        return self.table.tile_at(self.table.currentColumn()) if self.tiled else None
+
+    def _files_dropped(self, paths, row, column):
+        self.add_textures(paths, tile=self.table.tile_at(column) if self.tiled else None)
+
+    def _read_texture(self, path):
+        """A `TileTexture` for an image file, or None (and a log line) if it can't be read."""
+        try:
+            mtime = os.path.getmtime(path)
+            width, height, high_precision = image_info(path)
+        except OSError as e:
+            self.log(f"Couldn't read {os.path.basename(path)}: {e}", RED)
+            return None
+        return TileTexture(path, width, height, high_precision, mtime)
+
+    def add_textures(self, paths, tile=None):
+        """Add image files to the list.
+
+        Plain list: a row per texture (duplicates and unreadable files are
+        skipped). Tiled list: files go into rows and tiles as `placement`
+        decides; files without a tile number go into `tile` (default: the
+        first tile).
+        """
         if self.running:
+            return
+        paths = [p for p in paths if is_image(p)]
+        if self.tiled:
+            self._place_textures(paths, tile or self.table.tiles[0])
             return
         have = {_norm(r.path) for r in self.rows.values()}
         first_new = None
         for path in paths:
-            if not is_image(path) or _norm(path) in have:
+            if _norm(path) in have:
                 continue
-            try:
-                mtime = os.path.getmtime(path)
-                width, height, high_precision = image_info(path)
-            except OSError as e:
-                self.log(f"Couldn't read {os.path.basename(path)}: {e}", RED)
+            texture = self._read_texture(path)
+            if texture is None:
                 continue
             have.add(_norm(path))
-            table_row = self._add_row(path, width, height, high_precision, mtime)
+            table_row = self._insert_table_row(self._new_row({PLAIN: texture}, classify(path)))
             if first_new is None:
                 first_new = table_row
         if first_new is not None and not self.table.selectedItems():
             self.table.selectRow(first_new)
         self._update_enabled()
 
-    def _add_row(self, path, width, height, high_precision, mtime):
-        """Create the table row and its TextureRow. Returns the table row number."""
-        row_id = self.next_row_id
+    def _place_textures(self, paths, tile):
+        """Put textures into the tiled list (see `placement`), adding rows and tile columns as needed."""
+        textures = {p: t for p in paths if (t := self._read_texture(p)) is not None}
+        rows = list(self.rows.values())
+        slots = [placement.Slot(r.name, {t: x.path for t, x in r.textures.items()}) for r in rows]
+        new_rows = {}
+        for index, file_tile, path in placement.place(slots, list(textures), tile):
+            if index < len(rows):
+                row = rows[index]
+                row.textures[file_tile] = textures[path]
+                self._mark_edited(row)
+            elif index in new_rows:
+                new_rows[index].textures[file_tile] = textures[path]
+            else:
+                new_rows[index] = self._new_row({file_tile: textures[path]}, classify(path), slots[index].name)
+        used = {t for r in self.rows.values() for t in r.textures}
+        self._rebuild_table(sorted(set(self.table.tiles) | used))
+        if textures:
+            self.log(f"Added {len(textures)} texture(s)")
+
+    def _new_row(self, textures, kind, name="", fill=None):
+        """Create a `TextureRow` (not yet in the table)."""
+        row = TextureRow(self.next_row_id, textures, name=name, fill=fill, kind_hint=kind)
         self.next_row_id += 1
-        r = self.table.rowCount()
-        self.table.insertRow(r)
+        self.rows[row.id] = row
+        return row
 
-        name = QTableWidgetItem(os.path.basename(path))
-        name.setData(ROW_ID, row_id)
-        name.setToolTip(path)
-        self.table.setItem(r, 0, name)
+    def _insert_table_row(self, row):
+        """Add `row` at the end of the table with new widgets. Returns the table row number."""
+        table = self.table
+        r = table.rowCount()
+        table.blockSignals(True)                  # no itemChanged while filling in the row
+        try:
+            table.insertRow(r)
+            first = QTableWidgetItem(row.label)
+            first.setData(ROW_ID, row.id)
+            if row.tiled:
+                first.setToolTip("Output file name. Double-click to rename it.")
+            else:
+                first.setFlags(first.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                first.setToolTip(row.path)
+            table.setItem(r, 0, first)
 
-        type_combo = NoWheelComboBox()
-        for i, (kind, label, tip) in enumerate(KIND_CHOICES):
-            type_combo.addItem(label, kind)
-            type_combo.setItemData(i, tip, Qt.ItemDataRole.ToolTipRole)
-        type_combo.setCurrentIndex([k for k, _, _ in KIND_CHOICES].index(classify(path)))
-        type_combo.currentIndexChanged.connect(lambda _=0, rid=row_id: self._kind_changed(rid))
-        self.table.setCellWidget(r, 1, type_combo)
+            kind = row.kind
+            row.type_combo = NoWheelComboBox()
+            for i, (value, label, tip) in enumerate(KIND_CHOICES):
+                row.type_combo.addItem(label, value)
+                row.type_combo.setItemData(i, tip, Qt.ItemDataRole.ToolTipRole)
+            row.type_combo.setCurrentIndex([k for k, _, _ in KIND_CHOICES].index(kind))
+            row.type_combo.currentIndexChanged.connect(lambda _=0, rid=row.id: self._kind_changed(rid))
+            table.setCellWidget(r, table.type_column, row.type_combo)
 
-        size = QTableWidgetItem(_size_text(width, height, high_precision))
-        size.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.table.setItem(r, 2, size)
+            if self.tiled:
+                for tile in table.tiles:
+                    table.setItem(r, table.tile_column(tile), self._tile_item(row, tile))
+                row.fill_button = FillButton()
+                row.fill_button.show_fill(row.fill, kind == "normal")
+                row.fill_button.clicked.connect(lambda _=False, rid=row.id: self._fill_clicked(rid))
+                table.setCellWidget(r, table.fill_column, row.fill_button)
 
-        status_cell = StatusCell()
-        self.table.setCellWidget(r, 3, status_cell)
-        self.rows[row_id] = TextureRow(row_id, path, width, height, high_precision,
-                                       type_combo, status_cell, mtime=mtime)
+            size = QTableWidgetItem(_size_text(row.width, row.height, row.high_precision))
+            size.setFlags(size.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            size.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            table.setItem(r, table.size_column, size)
+
+            row.status_cell = StatusCell()
+            done = row.status in (Status.DONE, Status.FAILED, Status.MISSING)
+            row.status_cell.show_status(row.status, 1.0 if done else 0.0)
+            table.setCellWidget(r, table.status_column, row.status_cell)
+        finally:
+            table.blockSignals(False)
         return r
 
+    def _tile_item(self, row, tile):
+        """The cell showing which texture `row` uses for `tile`."""
+        texture = row.textures.get(tile)
+        item = QTableWidgetItem(os.path.basename(texture.path) if texture else "")
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        if texture:
+            item.setToolTip(f"{texture.path}\n{_size_text(texture.width, texture.height, texture.high_precision)}")
+        else:
+            item.setToolTip("No texture: parts in this tile get the row's fill. Drop a texture here, or "
+                            "double-click to choose one.")
+        return item
+
+    def _rebuild_table(self, tiles):
+        """Lay the table out for `tiles` ([] = plain) and fill it with every row again."""
+        current = self.table.currentRow(), self.table.currentColumn()
+        for row in self.rows.values():
+            row.kind_hint = row.kind              # the type dropdowns are about to be replaced
+            row.type_combo = row.status_cell = row.fill_button = None
+        self.table.set_tiles(tiles)
+        for row in self.rows.values():
+            self._insert_table_row(row)
+        self.texture_hint.setText(TILED_HINT if tiles else PLAIN_HINT)
+        if 0 <= current[0] < self.table.rowCount():
+            self.table.setCurrentCell(current[0], min(max(current[1], 0), self.table.columnCount() - 1))
+        self._update_enabled()
+        self._refresh_preview()
+
+    def _convert_rows(self, tiles):
+        """Switch the list between plain ([]) and tiled, turning the rows into the other kind."""
+        rows = list(self.rows.values())
+        if tiles and not self.tiled:              # plain -> tiled: textures are placed like dropped files
+            self.rows.clear()
+            slots = []
+            made = {}
+            for old in rows:
+                for index, tile, _ in placement.place(slots, [old.path], tiles[0]):
+                    if index in made:
+                        made[index].textures[tile] = old.first
+                    else:
+                        made[index] = self._new_row({tile: old.first}, old.kind, slots[index].name)
+        elif not tiles and self.tiled:            # tiled -> plain: a row per texture
+            self.rows.clear()
+            seen = set()
+            for old in rows:
+                for texture in old.textures.values():
+                    if _norm(texture.path) not in seen:
+                        seen.add(_norm(texture.path))
+                        self._new_row({PLAIN: texture}, old.kind)
+        self._rebuild_table(tiles)
+
     def _row_ids(self, selected_only=False):
-        """Row ids in table order (optionally only selected rows)."""
+        """Row ids in table order (optionally only rows with a selected cell)."""
         if selected_only:
             numbers = sorted({i.row() for i in self.table.selectedIndexes()})
         else:
@@ -600,9 +773,22 @@ class MainWindow(QMainWindow):
         return [self.table.item(r, 0).data(ROW_ID) for r in numbers]
 
     def _remove_selected(self):
+        """Remove the selected rows; in the tiled list, selecting only tile cells removes just those textures."""
         if self.running:
             return
-        for r in sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True):
+        selected = self.table.selectedIndexes()
+        cells = [(self.table.item(i.row(), 0).data(ROW_ID), self.table.tile_at(i.column())) for i in selected]
+        if self.tiled and cells and all(tile is not None for _, tile in cells):
+            for row_id, tile in cells:
+                row = self.rows[row_id]
+                if row.textures.pop(tile, None) is not None:
+                    self._mark_edited(row)
+            for row_id in {rid for rid, _ in cells}:
+                if not self.rows[row_id].textures:
+                    del self.rows[row_id]
+            self._rebuild_table(self.table.tiles)
+            return
+        for r in sorted({i.row() for i in selected}, reverse=True):
             self.rows.pop(self.table.item(r, 0).data(ROW_ID), None)
             self.table.removeRow(r)
         self._update_enabled()
@@ -618,18 +804,154 @@ class MainWindow(QMainWindow):
 
     def _kind_changed(self, row_id):
         row = self.rows.get(row_id)
-        if row and row.result_path:
+        if row is None:
+            return
+        if row.fill_button is not None:
+            row.fill_button.show_fill(row.fill, row.kind == "normal")
+        if row.result_path:
             row.result_path = ""
             self._set_status(row, Status.STALE)
+            self._refresh_preview()
+
+    def _mark_edited(self, row):
+        """A row's textures, name or fill changed: its last result no longer matches."""
+        if row.result_path or row.status in (Status.DONE, Status.FAILED):
+            row.result_path = ""
+            row.status = Status.EDITED
+            if row.status_cell is not None:
+                self._set_status(row, Status.EDITED)
+
+    def _table_row(self, row_id):
+        """Table row number of a row id, or -1."""
+        for r in range(self.table.rowCount()):
+            if self.table.item(r, 0).data(ROW_ID) == row_id:
+                return r
+        return -1
+
+    # -- tiled rows: names, textures per tile, fills ---------------------------------
+
+    def _item_changed(self, item):
+        """The user renamed an output (column 0 of the tiled list)."""
+        if not self.tiled or item.column() != 0:
+            return
+        row = self.rows.get(item.data(ROW_ID))
+        name = item.text().strip()
+        if row is None or name == row.name:
+            return
+        problem = ""
+        try:
+            check_map_name(name)
+        except TransferError as e:
+            problem = str(e)
+        if not problem and any(r is not row and r.name.lower() == name.lower() for r in self.rows.values()):
+            problem = f"Another output is already called {name}."
+        if problem or self.running:
+            self.table.blockSignals(True)
+            item.setText(row.name)
+            self.table.blockSignals(False)
+            if problem:
+                self.warn(problem)
+            return
+        row.name = name
+        self._mark_edited(row)
+        self._refresh_preview()
+
+    def rename_output(self, row_id, name):
+        """Rename a tiled row's output, as if typed into the table. Returns True if accepted."""
+        r = self._table_row(row_id)
+        if r < 0:
+            return False
+        self.table.item(r, 0).setText(name)
+        return self.rows[row_id].name == name
+
+    def _cell_double_clicked(self, r, column):
+        tile = self.table.tile_at(column)
+        if tile is None or self.running:
+            return
+        path = self.pick_texture(f"Texture for tile {tile}")
+        if path:
+            self.set_tile_texture(self.table.item(r, 0).data(ROW_ID), tile, path)
+
+    def set_tile_texture(self, row_id, tile, path):
+        """Use `path` for `tile` in a tiled row (None or "" removes the row's texture for that tile)."""
+        row = self.rows.get(row_id)
+        if row is None or self.running:
+            return
+        if path:
+            texture = self._read_texture(path)
+            if texture is None:
+                return
+            row.textures[tile] = texture
+        else:
+            row.textures.pop(tile, None)
+            if not row.textures:
+                del self.rows[row_id]
+        self._mark_edited(row)
+        self._rebuild_table(self.table.tiles)
+
+    def _fill_clicked(self, row_id):
+        row = self.rows.get(row_id)
+        if row is None or self.running:
+            return
+        menu = QMenu(self)
+        choose = menu.addAction("Choose colour…")
+        empty = menu.addAction("Leave empty")
+        chosen = menu.exec(row.fill_button.mapToGlobal(row.fill_button.rect().bottomLeft()))
+        if chosen is choose:
+            colour = self.pick_colour(row.fill)
+            if colour is not None:
+                self.set_fill(row_id, colour)
+        elif chosen is empty:
+            self.set_fill(row_id, None)
+
+    def set_fill(self, row_id, fill):
+        """Set a tiled row's fill colour (a tuple of 0..1 values) or None to leave those parts empty."""
+        row = self.rows.get(row_id)
+        if row is None or row.fill == fill:
+            return
+        row.fill = tuple(fill) if fill is not None else None
+        if row.fill_button is not None:
+            row.fill_button.show_fill(row.fill, row.kind == "normal")
+        self._mark_edited(row)
+
+    def _table_menu(self, pos):
+        index = self.table.indexAt(pos)
+        if not index.isValid() or self.running:
+            return
+        row_id = self.table.item(index.row(), 0).data(ROW_ID)
+        tile = self.table.tile_at(index.column())
+        menu = QMenu(self)
+        choose = remove_texture = None
+        if tile is not None:
+            choose = menu.addAction(f"Choose texture for tile {tile}…")
+            if tile in self.rows[row_id].textures:
+                remove_texture = menu.addAction(f"Remove the tile {tile} texture")
+            menu.addSeparator()
+        remove_row = menu.addAction("Remove this output" if self.tiled else "Remove this texture")
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen is choose:
+            self._cell_double_clicked(index.row(), index.column())
+        elif chosen is remove_texture:
+            self.set_tile_texture(row_id, tile, None)
+        elif chosen is remove_row:
+            self.table.clearSelection()
+            self.table.selectRow(index.row())
+            self.rows.pop(row_id, None)
+            self.table.removeRow(index.row())
+            self._update_enabled()
             self._refresh_preview()
 
     # -- setup files ----------------------------------------------------------------
 
     def current_setup(self):
         """The meshes, textures and settings in the window, as a `Setup`."""
+        rows = [self.rows[rid] for rid in self._row_ids()]
         return Setup(
             source=self.src_field.path(), target=self.dst_field.path(),
-            textures=[TextureEntry(self.rows[rid].path, self.rows[rid].kind) for rid in self._row_ids()],
+            textures=[TextureEntry(r.path, r.kind) for r in rows if not r.tiled],
+            maps=[r.to_map() for r in rows if r.tiled],
             output="" if self.out_auto else self.out_field.path(),
             uv_set=self.uv_spin.value(), options=self.options())
 
@@ -653,12 +975,35 @@ class MainWindow(QMainWindow):
             self.pad_spin.setValue(o.pad)
         self.sixteen_check.setChecked(o.sixteen_bit)
         self._clear_textures()
-        self.add_textures([t.path for t in setup.textures])
-        kinds = {_norm(t.path): t.kind for t in setup.textures}
-        choices = [k for k, _, _ in KIND_CHOICES]
-        for row in self.rows.values():
-            row.type_combo.setCurrentIndex(choices.index(kinds[_norm(row.path)]))
-        return [t.path for t in setup.textures if not is_image(t.path)]
+        missing = [t.path for t in setup.textures if not is_image(t.path)]
+        if setup.maps:
+            tiles = {t for m in setup.maps for t in m.tiles}
+            if self.transfer is not None and self._mesh_token() == self.mesh_token:
+                tiles |= set(self.transfer.tiles)
+            for m in setup.maps:
+                textures = {}
+                for tile, path in m.tiles.items():
+                    texture = self._read_texture(path) if is_image(path) else None
+                    if texture is None:
+                        missing.append(path)
+                    else:
+                        textures[tile] = texture
+                if textures:
+                    self._new_row(textures, m.kind, m.name, m.fill)
+            self._rebuild_table(sorted(tiles))
+            if setup.textures:                    # plain textures too: each becomes an output
+                self._place_textures([t.path for t in setup.textures if is_image(t.path)], min(tiles))
+        else:
+            if self.tiled:
+                self._rebuild_table([])
+            self.add_textures([t.path for t in setup.textures])
+            kinds = {_norm(t.path): t.kind for t in setup.textures}
+            choices = [k for k, _, _ in KIND_CHOICES]
+            for row in self.rows.values():
+                row.type_combo.setCurrentIndex(choices.index(kinds[_norm(row.path)]))
+        if self.transfer is not None and self._mesh_token() == self.mesh_token:
+            self._apply_mesh_tiles(self.transfer.tiles)      # same meshes as before: no reload to do it
+        return missing
 
     def open_setup_dialog(self):
         start = os.path.dirname(self.setup_path) or self.settings.value("last_setup_dir", "")
@@ -752,20 +1097,25 @@ class MainWindow(QMainWindow):
         self._update_enabled()
 
     def _reload_row(self, row, table_row):
-        """Re-read one texture's size and format. Returns "same", "changed" or "missing".
+        """Re-read a row's textures' sizes and formats. Returns "same", "changed" or "missing".
 
-        A finished transfer is marked out of date if its texture changed since.
+        A finished transfer is marked out of date if one of its textures changed since.
         """
-        try:
-            mtime = os.path.getmtime(row.path)
-            row.width, row.height, row.high_precision = image_info(row.path)
-        except OSError as e:
-            row.result_path = ""
-            self._set_status(row, Status.MISSING, 1.0, tooltip=f"{row.path}\n{e}")
-            return "missing"
-        self.table.item(table_row, 2).setText(_size_text(row.width, row.height, row.high_precision))
-        changed = mtime != row.mtime
-        row.mtime = mtime
+        changed = False
+        for tile, texture in row.textures.items():
+            try:
+                mtime = os.path.getmtime(texture.path)
+                texture.width, texture.height, texture.high_precision = image_info(texture.path)
+            except OSError as e:
+                row.result_path = ""
+                self._set_status(row, Status.MISSING, 1.0, tooltip=f"{texture.path}\n{e}")
+                return "missing"
+            changed = changed or mtime != texture.mtime
+            texture.mtime = mtime
+            if tile != PLAIN:
+                self.table.setItem(table_row, self.table.tile_column(tile), self._tile_item(row, tile))
+        self.table.item(table_row, self.table.size_column).setText(
+            _size_text(row.width, row.height, row.high_precision))
         if changed and row.result_path:
             row.result_path = ""
             self._set_status(row, Status.CHANGED)
@@ -786,7 +1136,7 @@ class MainWindow(QMainWindow):
         out = self.out_field.path()
         if out:
             candidate = os.path.join(out, row.output_name(self.sixteen_check.isChecked()))
-            if os.path.isfile(candidate) and _norm(candidate) != _norm(row.path):
+            if os.path.isfile(candidate) and all(_norm(candidate) != _norm(t.path) for t in row.textures.values()):
                 return candidate, " (existing file)"
         return "", ""
 
@@ -794,6 +1144,9 @@ class MainWindow(QMainWindow):
         self.preview_request += 1
         request = self.preview_request
         selected = self._row_ids(selected_only=True)
+        current = self.table.currentRow()
+        if 0 <= current < self.table.rowCount() and self.table.item(current, 0).data(ROW_ID) in selected:
+            selected.insert(0, self.table.item(current, 0).data(ROW_ID))
         row = self.rows.get(selected[0]) if selected else None
         if row is None:
             self.preview_name.setText("Select a texture to preview it")
@@ -801,12 +1154,23 @@ class MainWindow(QMainWindow):
             self.after_view.set_image(None)
             return
         after, note = self._after_path(row)
-        self.preview_name.setText(os.path.basename(row.path) + note)
+        if row.tiled:                             # the selected tile's texture, with only that tile's UVs
+            tile = self._current_tile()
+            tile = tile if tile in row.textures else min(row.textures)
+            before = row.textures[tile].path
+            self.before_view.title = f"Before  (tile {tile}, source UVs)"
+            self.before_view.set_wireframe(self.tile_wireframes.get(tile))
+            self.preview_name.setText(f"{row.name}: tile {tile}, {os.path.basename(before)}{note}")
+        else:
+            before = row.path
+            self.before_view.title = "Before  (source UVs)"
+            self.before_view.set_wireframe(self.src_wireframe)
+            self.preview_name.setText(os.path.basename(row.path) + note)
         self.before_view.set_image(None, message="Loading…")
         self.after_view.set_image(None, message="Loading…" if after else "Not transferred yet")
 
         def work():
-            self.bridge.previewReady.emit(request, (row.path, self.previews.get(row.path)),
+            self.bridge.previewReady.emit(request, (before, self.previews.get(before)),
                                           (after, self.previews.get(after)))
 
         threading.Thread(target=work, daemon=True, name="preview").start()
@@ -835,7 +1199,12 @@ class MainWindow(QMainWindow):
             w.setEnabled(idle)
         self.pad_spin.setEnabled(idle and not self.fill_check.isChecked())
         for row in self.rows.values():
-            row.type_combo.setEnabled(idle)
+            if row.type_combo is not None:
+                row.type_combo.setEnabled(idle)
+            if row.fill_button is not None:
+                row.fill_button.setEnabled(idle and row.kind != "normal")
+        self.remove_btn.setToolTip("Remove the selected outputs, or only the selected tile textures"
+                                   if self.tiled else "Remove the selected textures")
         if not self.rows:
             self.run_btn.setToolTip("Add some textures first")
         elif self.transfer is None:
@@ -882,9 +1251,10 @@ class MainWindow(QMainWindow):
         dupes = sorted({n for n in lowered if lowered.count(n) > 1})
         if dupes:
             self.warn("These textures would be saved under the same name:\n\n" + "\n".join(dupes)
-                      + "\n\nRemove one of each, or rename the files.")
+                      + "\n\nRemove one of each, or rename the files or outputs.")
             return False
-        clash = [n for r, n in zip(rows, names, strict=True) if _norm(os.path.join(out_dir, n)) == _norm(r.path)]
+        clash = [n for r, n in zip(rows, names, strict=True)
+                 if any(_norm(os.path.join(out_dir, n)) == _norm(t.path) for t in r.textures.values())]
         if clash:
             self.warn("The output folder is the folder the textures are in, so the originals would "
                       "be overwritten:\n\n" + "\n".join(clash) + "\n\nChoose a different output folder.")
@@ -915,16 +1285,17 @@ class MainWindow(QMainWindow):
         for row in rows:
             row.result_path = ""
             row.stage = ""
-            try:
-                row.mtime = os.path.getmtime(row.path)    # the version this transfer reads
-            except OSError:
-                pass                                      # the worker reports the missing file
+            for texture in row.textures.values():
+                try:
+                    texture.mtime = os.path.getmtime(texture.path)   # the version this transfer reads
+                except OSError:
+                    pass                                  # the worker reports the missing file
             self._set_status(row, Status.WAITING)
-        jobs = [Job(r.id, r.path, r.kind) for r in rows]
+        jobs = [Job(r.id, tiled=r.to_map()) if r.tiled else Job(r.id, r.path, r.kind) for r in rows]
         self.worker = TransferWorker(self.bridge, self.transfer, jobs, out_dir, opts)
         self.cancel_btn.setText("Cancel")
         self._update_enabled()
-        self.log(f"Transferring {len(jobs)} texture(s) to {out_dir}")
+        self.log(f"Transferring {len(jobs)} {'output' if self.tiled else 'texture'}(s) to {out_dir}")
         self.save_settings()
         self.worker.start()
 
@@ -949,7 +1320,7 @@ class MainWindow(QMainWindow):
         row.result_path = result.path
         tooltip = "\n".join([result.path, f"UV coverage {100 * result.coverage:.1f}%"] + result.notes)
         self._set_status(row, Status.DONE, 1.0, tooltip=tooltip)
-        name = os.path.basename(row.path)
+        name = row.label
         self.log(f"{name} → {result.path}  ({'; '.join(result.notes + [f'{seconds:.1f}s'])})", GREEN)
         for note in result.notes:
             if "precision" in note or "couldn't" in note:
@@ -962,7 +1333,7 @@ class MainWindow(QMainWindow):
         row = self.rows.get(row_id)
         if not row:
             return
-        name = os.path.basename(row.path)
+        name = row.label
         if cancelled:
             self._set_status(row, Status.CANCELLED)
             self.log(f"{name}: cancelled", AMBER)

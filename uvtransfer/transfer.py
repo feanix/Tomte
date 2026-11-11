@@ -5,6 +5,10 @@ For every sub-sample of the output texture, find the target triangle it lies
 in, take the same barycentric point on the source triangle (same mesh, old
 UVs), and sample the input texture there. Colour is averaged in linear light;
 normal maps are converted into the target's tangent frames.
+
+A source mesh can spread its parts over several UDIM tiles, each with its own
+texture (`TiledMap`, `Transfer.transfer_map`): every target triangle is then
+sampled from the texture of the tile its source triangle lies in.
 """
 
 import os
@@ -14,8 +18,10 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import normalmaps
+from . import tiles as udims
 from .errors import Cancelled, TransferError
-from .images import linear_to_srgb, load_image, sample_bilinear, save_image, srgb_to_linear
+from .images import (IMAGE_EXTENSIONS, image_info, linear_to_srgb, load_image, sample_bilinear, save_image,
+                     srgb_to_linear)
 from .mesh import Mesh, load_fbx_parts
 from .padding import dilate
 from .raster import BATCH_SAMPLES, TILE_RANGE, RasterPlan, coverage_counts, run_batches, sum_by_pixel
@@ -98,6 +104,55 @@ class Result:
     def coverage(self):
         """Fraction of the output covered by target UVs."""
         return float(self.mask.mean())
+
+
+@dataclass
+class TiledMap:
+    """One output texture put together from a texture per source UDIM tile.
+
+    Attributes:
+        name: output file name, e.g. "Head_Basecolor.png" (16-bit output is always PNG).
+        tiles: {UDIM number: texture path}, e.g. {1001: "Head_Basecolor.png",
+            1002: "Teeth_Color.png"}.
+        kind: "srgb", "normal" or "linear"; None guesses it from the first
+            texture's name (see `classify`).
+        fill: for source triangles whose tile has no texture: a colour as
+            stored in the file (1 to 4 values in 0..1, e.g. (0.5, 0.5, 0.5)),
+            or None to leave them empty so edge padding covers them. Normal
+            maps always get a flat normal there.
+    """
+
+    name: str
+    tiles: dict
+    kind: str = None
+    fill: tuple = None
+
+
+def check_fill(fill):
+    """A fill colour as a tuple of 1 to 4 floats in 0..1, or None for no fill.
+
+    Raises:
+        TransferError: it isn't one.
+    """
+    if fill is None:
+        return None
+    if isinstance(fill, np.ndarray):
+        fill = fill.tolist()
+    ok = isinstance(fill, (list, tuple)) and 1 <= len(fill) <= 4 and all(
+        isinstance(c, (int, float)) and not isinstance(c, bool) and 0 <= c <= 1 for c in fill)
+    if not ok:
+        raise TransferError(f"The fill must be 1 to 4 numbers from 0 to 1, not {fill!r}")
+    return tuple(float(c) for c in fill)
+
+
+def check_map_name(name):
+    """Raise TransferError unless `name` is a plain image file name such as "Body_Basecolor.png"."""
+    if not isinstance(name, str) or not name.strip() or os.path.basename(name) != name \
+            or name in (".", "..") or "/" in name or "\\" in name:
+        raise TransferError(f"A map's name must be a file name such as \"Body_Basecolor.png\", not {name!r}")
+    if os.path.splitext(name)[1].lower() not in IMAGE_EXTENSIONS:
+        raise TransferError(f"The map name {name!r} needs an image extension "
+                            f"({', '.join(IMAGE_EXTENSIONS)})")
 
 
 def classify(name, overrides=None):
@@ -197,6 +252,7 @@ class Transfer:
 
     Attributes:
         warnings: messages for the user about the meshes (none are fatal).
+        tiles: UDIM tiles the source UVs use, in order, e.g. [1001, 1002, 1003].
 
     Raises:
         TransferError: the meshes don't have the same topology.
@@ -205,11 +261,14 @@ class Transfer:
     def __init__(self, src, dst, notes=None):
         self.src, self.dst = src, dst
         _check_topology(src, dst)
-        self.warnings = list(notes or []) + _mesh_warnings(src, dst)
         self._frames = None
         self._coverage = {}
         self._src_tri_uv = src.uv[src.tris]
         self._dst_tri_uv = dst.uv[dst.tris]
+        self._src_tile = udims.triangle_tiles(self._src_tri_uv)
+        self.tiles = [int(t) for t in np.unique(self._src_tile) if t != udims.NO_TILE]
+        self.warnings = (list(notes or []) + _mesh_warnings(src, dst, len(self.tiles) > 1)
+                         + self._tile_warnings())
 
     @classmethod
     def from_fbx(cls, src_path, dst_path, uv_set=0):
@@ -244,6 +303,32 @@ class Transfer:
     @property
     def mesh_names(self):
         return [p.name for p in self.src.parts]
+
+    def tile_shares(self):
+        """{tile: fraction of the target UV area whose source triangles lie in that tile}.
+
+        Triangles outside the UDIM range are left out.
+        """
+        uv = self._dst_tri_uv
+        area = 0.5 * np.abs((uv[:, 1, 0] - uv[:, 0, 0]) * (uv[:, 2, 1] - uv[:, 0, 1])
+                            - (uv[:, 2, 0] - uv[:, 0, 0]) * (uv[:, 1, 1] - uv[:, 0, 1]))
+        total = max(float(area.sum()), 1e-20)
+        return {t: float(area[self._src_tile == t].sum()) / total for t in self.tiles}
+
+    def _tile_warnings(self):
+        if len(self.tiles) < 2:
+            return []
+        warnings = [f"The source UVs use tiles {udims.describe(self.tiles)}. A tiled map gives each "
+                    "tile its own texture; a single texture wraps onto all of them."]
+        n = int(udims.straddling(self._src_tri_uv, self._src_tile).sum())
+        if n:
+            warnings.append(f"{n:,} source triangle(s) cross a tile edge. They're sampled from the "
+                            "tile their centre is in, so they may pick up the wrong texture at the edge.")
+        n = int((self._src_tile == udims.NO_TILE).sum())
+        if n:
+            warnings.append(f"{n:,} source triangle(s) are outside the UDIM tiles (U 0 to 10, V 0 and "
+                            "up). In a tiled transfer they get the map's fill.")
+        return warnings
 
     def summary(self):
         """One-line description, e.g. "482 vertices, 960 triangles, 1 mesh"."""
@@ -327,6 +412,82 @@ class Transfer:
         report(1.0, "Done")
         return result
 
+    def transfer_tiles(self, images, kind, options=None, fill=None, progress=None, cancel=None):
+        """Transfer one map from images held in memory, one per source UDIM tile.
+
+        Args:
+            images: {UDIM number: HxWxC float32 in 0..1, as stored on disk}.
+            kind: "srgb", "normal" or "linear".
+            options: `Options`; defaults if None. With size 0 the output takes
+                the size of the largest image.
+            fill: see `TiledMap.fill`.
+            progress, cancel: as for `transfer_image`.
+
+        Returns:
+            Result.
+
+        Raises:
+            TransferError: invalid settings, tiles or fill, or a normal map without RGB.
+            Cancelled: `cancel` returned True.
+        """
+        sources = {tile: _Source(img.shape[1], img.shape[0], lambda img=img: img, f"tile {tile}")
+                   for tile, img in images.items()}
+        return self._transfer_tiled(sources, kind, fill, options or Options(), _Progress(progress, cancel))
+
+    def transfer_map(self, tiled, out_dir, options=None, progress=None, cancel=None):
+        """Put together a `TiledMap` from its textures and save it into `out_dir`.
+
+        Textures are loaded one at a time, so the peak memory is about that
+        of transferring the largest one alone (see `estimate_memory`).
+
+        Args:
+            tiled: `TiledMap`.
+            out_dir: output folder (created if needed).
+            options, progress, cancel: as for `transfer_tiles`.
+
+        Returns:
+            Result with `path` set to the saved file.
+
+        Raises:
+            TransferError: no textures, an unreadable texture, invalid settings,
+                tiles or fill, the output would overwrite an input, or it can't
+                be written.
+            Cancelled: `cancel` returned True.
+        """
+        o = options or Options()
+        o.validate()
+        report = _Progress(progress, cancel)
+        check_map_name(tiled.name)
+        if not tiled.tiles:
+            raise TransferError(f"{tiled.name}: no textures to transfer")
+        load_notes, sources, sixteen = [], {}, o.sixteen_bit
+        for tile, path in sorted(tiled.tiles.items(), key=lambda item: udims.tile_number(item[0])):
+            label = os.path.basename(path)
+            try:
+                width, height, high_precision = image_info(path)
+            except OSError as e:
+                raise TransferError(f"Couldn't read {label}: {e}") from e
+            sixteen = sixteen or high_precision
+            sources[tile] = _Source(width, height, _loader(path, load_notes), label)
+        out_path = os.path.join(out_dir, output_name(tiled.name, sixteen))
+        inputs = {os.path.normcase(os.path.abspath(p)) for p in tiled.tiles.values()}
+        if os.path.normcase(os.path.abspath(out_path)) in inputs:
+            raise TransferError(f"The output {os.path.basename(out_path)} would overwrite one of its "
+                                "textures. Choose a different name or output folder.")
+
+        kind = tiled.kind or classify(next(iter(sources.values())).label)
+        result = self._transfer_tiled(sources, kind, tiled.fill, o, report.sub(0.0, 0.95))
+        result.notes = load_notes + result.notes
+        report(0.95, "Saving")
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            save_image(out_path, result.image, sixteen)
+        except OSError as e:
+            raise TransferError(f"Couldn't save {out_path}: {e.strerror or e}") from e
+        result.path = out_path
+        report(1.0, "Done")
+        return result
+
     def _transfer(self, img, kind, o, report):
         o.validate()
         if kind not in KINDS:
@@ -349,57 +510,230 @@ class Transfer:
         report(1.0)
         return Result(image, mask, kind, convention, notes)
 
+    def _transfer_tiled(self, sources, kind, fill, o, report):
+        """Transfer one map from {tile: _Source}. See `transfer_tiles`."""
+        o.validate()
+        if kind not in KINDS:
+            raise TransferError(f"Unknown texture type {kind!r}; use one of {', '.join(KINDS)}")
+        if not sources:
+            raise TransferError("No textures to transfer")
+        sources = {udims.tile_number(tile): source for tile, source in sources.items()}
+        fill = _fill_value(fill, kind)
+        notes = []
+        unused = sorted(t for t in sources if t not in self.tiles)
+        if unused:
+            notes.append(f"No part of the source mesh is in tile {udims.describe(unused)}, "
+                         "so its texture was skipped.")
+        # largest part first: with auto-detection it decides the normal map format of the result
+        shares = self.tile_shares()
+        textured = sorted((t for t in sources if t in shares), key=lambda t: -shares[t])
+        size_from = [sources[t] for t in textured] or list(sources.values())
+        largest = max(size_from, key=lambda s: s.width * s.height)
+        out_w, out_h = output_size(largest.width, largest.height, o.size)
+
+        rest = np.flatnonzero(~np.isin(self._src_tile, textured))
+        weights = [shares[t] for t in textured]
+        weights.append(max(0.0, 1.0 - sum(weights)) if fill is not None and rest.size else 0.0)
+        total = max(sum(weights), 1e-20)
+        ends = np.cumsum(weights) / total
+        starts = ends - np.asarray(weights) / total
+
+        acc, out_convention, tile_notes = None, "", {}
+        for i, tile in enumerate(textured):
+            source = sources[tile]
+            step = report.sub(0.85 * starts[i], 0.85 * ends[i])
+            step(0.0, f"Loading {source.label}")
+            img = source.load()
+            channels = img.shape[2]
+            if kind == "normal" and channels < 3:
+                raise TransferError(f"{source.label}: a normal map needs RGB channels; this image has "
+                                    f"{channels}. Set the map's type to Data instead.")
+            directx = directx_out = None
+            if kind == "normal":
+                convention, note = self._tile_convention(img, tile, o.normal_convention, step)
+                out_convention = out_convention or convention
+                directx, directx_out = convention == "dx", out_convention == "dx"
+                if convention != out_convention:
+                    note += f", converted to {_CONVENTION_NAMES[out_convention]} to match the rest"
+                tile_notes[tile] = f"Tile {tile}: {note}"
+            work = _linearise(img, kind)
+            del img
+            acc = acc.widened(channels) if acc else _Accumulator(out_w * out_h, channels)
+
+            def sample(tri, bary, work=work, directx=directx, directx_out=directx_out, width=acc.channels):
+                return _conform(self._sample_source(work, kind, directx, tri, bary, directx_out), width)
+
+            step(0.05, "Transferring")
+            self._accumulate(np.flatnonzero(self._src_tile == tile), out_w, out_h, o, sample, acc,
+                             step.sub(0.05, 1.0))
+            del work, sample
+        notes += [tile_notes[t] for t in sorted(tile_notes)]
+
+        if fill is not None and rest.size:
+            acc = acc.widened(len(fill)) if acc else _Accumulator(out_w * out_h, len(fill))
+            value = _conform(fill, acc.channels)
+            step = report.sub(0.85 * starts[-1], 0.85)
+            step(0.0, "Filling parts without a texture")
+            self._accumulate(rest, out_w, out_h, o,
+                             lambda tri, bary: np.broadcast_to(value, (len(tri), len(value))), acc, step)
+        elif rest.size and textured:
+            notes.append("Parts of the mesh whose tile has no texture were left empty.")
+        if acc is None:
+            acc = _Accumulator(out_w * out_h, 3 if kind == "normal" else 4)
+        out, mask = acc.average(out_w, out_h)
+        image, _ = _finish(out, mask, kind, o.pad, report.sub(0.85, 1.0))
+        report(1.0)
+        return Result(image, mask, kind, out_convention, notes)
+
     def _resolve_convention(self, img, requested, report):
         """("dx" or "gl", note) - detected from the image when requested is "auto"."""
         report(0.0, "Preparing tangent frames")
         self.frames()
         if requested != "auto":
-            return requested, {"dx": "DirectX normal map", "gl": "OpenGL normal map"}[requested]
+            return requested, _CONVENTION_NAMES[requested] + " normal map"
         report(0.02, "Detecting normal map format")
         height, width = img.shape[:2]
         return normalmaps.detect_convention(img, self.source_coverage(width, height))
 
+    def _tile_convention(self, img, tile, requested, report):
+        """Like `_resolve_convention`, judged only on the part of the image that `tile` uses."""
+        report(0.0, "Preparing tangent frames")
+        self.frames()
+        if requested != "auto":
+            return requested, _CONVENTION_NAMES[requested] + " normal map"
+        report(0.02, "Detecting normal map format")
+        height, width = img.shape[:2]
+        key = (tile, width, height)
+        if key not in self._coverage:
+            mine = self._src_tile == tile
+            local = udims.local_uv(self._src_tri_uv[mine], self._src_tile[mine])
+            self._coverage[key] = coverage_counts(local, width, height) > 0
+        return normalmaps.detect_convention(img, self._coverage[key])
+
     def _resample(self, work, kind, directx, out_w, out_h, o, report):
         """Average source samples into an out_h x out_w image. Returns (image, covered mask)."""
         report(0.0, "Transferring")
-        plan = RasterPlan(self._dst_tri_uv, out_w, out_h, o.supersample)
-        channels = work.shape[2]
-        sums = np.zeros((out_w * out_h, channels), np.float32)
-        counts = np.zeros(out_w * out_h, np.float32)
+        acc = _Accumulator(out_w * out_h, work.shape[2])
+        self._accumulate(None, out_w, out_h, o,
+                         lambda tri, bary: self._sample_source(work, kind, directx, tri, bary), acc, report)
+        return acc.average(out_w, out_h)
+
+    def _accumulate(self, tris, out_w, out_h, o, sample, acc, report):
+        """Add sample(tri, bary) for every sub-sample of target triangles `tris` (None: all) into `acc`."""
+        tri_uv = self._dst_tri_uv if tris is None else self._dst_tri_uv[tris]
+        plan = RasterPlan(tri_uv, out_w, out_h, o.supersample)
 
         def sample_batch(k):                      # runs on worker threads
             hits = plan.batch(k)
             if hits is None:
                 return None
             tri, pixel, bary = hits
-            return sum_by_pixel(pixel, self._sample_source(work, kind, directx, tri, bary))
+            return sum_by_pixel(pixel, sample(tri if tris is None else tris[tri], bary))
 
         def add(k, batch_sums):                   # runs on this thread, in batch order
             if batch_sums is not None:
                 pixels, n, total = batch_sums
-                counts[pixels] += n
-                sums[pixels] += total
+                acc.counts[pixels] += n
+                acc.sums[pixels] += total
             report(plan.done_after(k))
 
         run_batches(plan, sample_batch, o.threads or default_workers(), add)
-        covered = counts > 0
-        sums[covered] /= counts[covered][:, None]
-        return sums.reshape(out_h, out_w, channels), covered.reshape(out_h, out_w)
 
-    def _sample_source(self, work, kind, directx, tri, bary):
+    def _sample_source(self, work, kind, directx, tri, bary, directx_out=None):
         """Values of the source texture at the source-UV positions of target sub-samples."""
         src_uv = np.einsum("nk,nkj->nj", bary, self._src_tri_uv[tri])
         values = sample_bilinear(work, src_uv[:, 0], src_uv[:, 1])
         if kind == "normal":
             src_frames, dst_frames = self.frames()
             values[:, :3] = normalmaps.reorient(values[:, :3], bary, src_frames, self.src.tris[tri],
-                                                dst_frames, self.dst.tris[tri], directx)
+                                                dst_frames, self.dst.tris[tri], directx, directx_out)
         return values
 
 
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
+
+_CONVENTION_NAMES = {"dx": "DirectX", "gl": "OpenGL"}
+
+
+@dataclass
+class _Source:
+    """One tile's texture: its size, and how to load it (HxWxC float32 in 0..1)."""
+
+    width: int
+    height: int
+    load: object
+    label: str
+
+
+def _loader(path, notes):
+    """A function that loads `path` and adds its load notes to `notes`."""
+    def load():
+        loaded = load_image(path)
+        notes.extend(f"{os.path.basename(path)}: {note}" for note in loaded.notes)
+        return loaded.pixels
+    return load
+
+
+def _fill_value(fill, kind):
+    """The fill in working space (linear light for colour), flat for normal maps, or None."""
+    if kind == "normal":
+        return np.float32(_FLAT_NORMAL)
+    fill = check_fill(fill)
+    if fill is None:
+        return None
+    return _linearise(np.float32(fill)[None, None, :], kind)[0, 0]
+
+
+def _channel_layout(channels):
+    """(colour channels, has alpha) of an image with this many channels."""
+    return _colour_channels(channels), channels in (2, 4)
+
+
+def _conform(values, channels, one=1.0):
+    """(..., C) values as (..., channels): grey is repeated into RGB, missing alpha is `one`."""
+    have = values.shape[-1]
+    if have == channels:
+        return values
+    colour_in, alpha_in = _channel_layout(have)
+    colour_out, alpha_out = _channel_layout(channels)
+    colour = values[..., :colour_in]
+    if colour_out > colour_in:
+        colour = np.repeat(colour, colour_out, axis=-1)
+    parts = [colour]
+    if alpha_out:
+        parts.append(values[..., -1:] if alpha_in
+                     else np.broadcast_to(np.asarray(one, np.float32), values.shape[:-1] + (1,)))
+    return np.concatenate(parts, axis=-1).astype(np.float32, copy=False)
+
+
+class _Accumulator:
+    """Per-pixel sums and sample counts for an output image being built."""
+
+    def __init__(self, n_pixels, channels):
+        self.sums = np.zeros((n_pixels, channels), np.float32)
+        self.counts = np.zeros(n_pixels, np.float32)
+
+    @property
+    def channels(self):
+        return self.sums.shape[1]
+
+    def widened(self, channels):
+        """This accumulator, with room for values with `channels` channels too."""
+        colour_a, alpha_a = _channel_layout(self.channels)
+        colour_b, alpha_b = _channel_layout(channels)
+        wanted = max(colour_a, colour_b) + (1 if alpha_a or alpha_b else 0)
+        if wanted != self.channels:
+            # pixels summed so far count as opaque: their alpha sum is their sample count
+            self.sums = _conform(self.sums, wanted, one=self.counts[:, None])
+        return self
+
+    def average(self, width, height):
+        """(HxWxC average, HxW covered mask). Reuses the sums array."""
+        covered = self.counts > 0
+        self.sums[covered] /= self.counts[covered][:, None]
+        return self.sums.reshape(height, width, -1), covered.reshape(height, width)
 
 def _colour_channels(channels):
     """How many leading channels hold colour (the rest is alpha)."""
@@ -493,14 +827,20 @@ def _check_topology(src, dst):
                 "changed). Both FBX files must be the same mesh with only the UVs changed.")
 
 
-def _mesh_warnings(src, dst):
-    """Non-fatal problems worth telling the user about."""
+def _mesh_warnings(src, dst, tiled_source=False):
+    """Non-fatal problems worth telling the user about.
+
+    With `tiled_source`, source UVs outside 0 to 1 are expected (UDIM tiles)
+    and aren't warned about here.
+    """
     warnings = []
     drift = np.abs(src.P - dst.P).max()
     if drift > POSITION_DRIFT_WARN * max(1e-9, np.abs(src.P).max()):
         warnings.append(f"Vertex positions differ between the files (by up to {drift:.4g}). "
                         "This is usually harmless, e.g. a different export scale.")
     for label, mesh in (("source", src), ("target", dst)):
+        if label == "source" and tiled_source:
+            continue
         outside = ((mesh.uv < -1e-4) | (mesh.uv > 1 + 1e-4)).any(axis=1).mean()
         if outside > 0.001:
             warnings.append(f"{100 * outside:.1f}% of the {label} UVs are outside the 0 to 1 square. "

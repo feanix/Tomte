@@ -11,6 +11,8 @@ islands come out right.
 Command line: python -m uvtransfer --help
 Desktop app:  python -m uvtransfer.gui
 Saved setups: Setup.load("Body.tomte"), python -m uvtransfer --setup Body.tomte
+Parts in UDIM tiles, one texture each:
+    xfer.transfer_map(TiledMap("Basecolor.png", {1001: "Head.png", 1002: "Teeth.png"}), "out")
 """
 
 from .errors import Cancelled, TransferError
@@ -18,14 +20,14 @@ from .images import IMAGE_EXTENSIONS, image_info, load_image, save_image
 from .mesh import Mesh, MeshPart, load_fbx_parts
 from .setupfile import Setup, TextureEntry
 from .system import available_memory, default_workers
-from .transfer import (KIND_LABELS, KINDS, Options, Result, Transfer, classify,
+from .transfer import (KIND_LABELS, KINDS, Options, Result, TiledMap, Transfer, classify,
                        default_output_dir, estimate_memory, output_name, output_size)
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
 __all__ = [
     "Cancelled", "TransferError", "IMAGE_EXTENSIONS", "image_info", "load_image", "save_image",
     "Mesh", "MeshPart", "load_fbx_parts", "Setup", "TextureEntry", "available_memory",
-    "default_workers", "KIND_LABELS", "KINDS", "Options", "Result", "Transfer", "classify",
+    "default_workers", "KIND_LABELS", "KINDS", "Options", "Result", "TiledMap", "Transfer", "classify",
     "default_output_dir", "estimate_memory", "output_name", "output_size",
 ]

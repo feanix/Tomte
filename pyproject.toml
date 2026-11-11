@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "uvtransfer"
-version = "1.0.1"
+version = "1.1.0"
 description = "Tomte: move textures (including tangent-space normal maps) between two UV layouts of the same mesh"
 readme = "README.md"
 requires-python = ">=3.10"

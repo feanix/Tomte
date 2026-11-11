@@ -94,28 +94,78 @@ class FileField(QWidget):
 
 
 class TextureTable(QTableWidget):
-    """Table of textures (name, type, size, status) that accepts dropped image files."""
+    """Table of outputs that accepts dropped image files.
 
-    filesDropped = Signal(list)
-    COLUMNS = ("Texture", "Type", "Size", "Status")
+    Plain layout: Texture, Type, Size, Status (one row per texture).
+    Tiled layout: Output, Type, a column per UDIM tile, Fill, Size, Status
+    (one row per output, put together from a texture per tile).
+
+    Signals:
+        filesDropped(paths, row, column): image files dropped on a cell
+            (row and column are -1 when dropped below the rows).
+    """
+
+    filesDropped = Signal(list, int, int)
+    PLAIN_COLUMNS = ("Texture", "Type", "Size", "Status")
+    type_column = 1
 
     def __init__(self):
-        super().__init__(0, len(self.COLUMNS))
-        self.setHorizontalHeaderLabels(self.COLUMNS)
-        header = self.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        self.setColumnWidth(3, 200)
+        super().__init__(0, 0)
+        self.tiles = []
         self.verticalHeader().setVisible(False)
         self.verticalHeader().setDefaultSectionSize(30)
-        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked
+                             | QAbstractItemView.EditTrigger.EditKeyPressed)
         self.setAcceptDrops(True)
         self.viewport().setAcceptDrops(True)
         self.setMinimumHeight(140)
+        self.set_tiles([])
+
+    def set_tiles(self, tiles):
+        """Use the tiled layout with these tile columns, or the plain layout for []. Removes all rows."""
+        self.setRowCount(0)
+        self.tiles = list(tiles)
+        labels = (["Output", "Type"] + [str(t) for t in self.tiles] + ["Fill", "Size", "Status"]
+                  if self.tiles else list(self.PLAIN_COLUMNS))
+        self.setColumnCount(len(labels))
+        self.setHorizontalHeaderLabels(labels)
+        header = self.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        if self.tiles:
+            for column in self.tile_columns():
+                header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+            self.setColumnWidth(0, 170)
+        else:
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.status_column, QHeaderView.ResizeMode.Fixed)
+        self.setColumnWidth(self.status_column, 200)
+        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems if self.tiles
+                                  else QAbstractItemView.SelectionBehavior.SelectRows)
+
+    def tile_columns(self):
+        return range(2, 2 + len(self.tiles))
+
+    def tile_column(self, tile):
+        return 2 + self.tiles.index(tile)
+
+    def tile_at(self, column):
+        """The tile shown in `column`, or None."""
+        i = column - 2
+        return self.tiles[i] if self.tiles and 0 <= i < len(self.tiles) else None
+
+    @property
+    def fill_column(self):
+        return 2 + len(self.tiles) if self.tiles else None
+
+    @property
+    def size_column(self):
+        return self.columnCount() - 2
+
+    @property
+    def status_column(self):
+        return self.columnCount() - 1
 
     def _image_paths(self, e):
         return [p for p in local_paths(e.mimeData()) if is_image(p)]
@@ -132,15 +182,42 @@ class TextureTable(QTableWidget):
         paths = self._image_paths(e)
         if paths:
             e.acceptProposedAction()
-            self.filesDropped.emit(paths)
+            index = self.indexAt(e.position().toPoint())
+            self.filesDropped.emit(paths, index.row(), index.column())
 
     def paintEvent(self, e):
         super().paintEvent(e)
         if self.rowCount() == 0:
             p = QPainter(self.viewport())
             p.setPen(QColor(GREY))
-            p.drawText(self.viewport().rect(), Qt.AlignmentFlag.AlignCenter,
-                       "Drop colour and normal map textures here\nor click Add…")
+            text = ("Drop textures here. UDIM-numbered files find their own tile;\n"
+                    "others go into the tile column you drop them on." if self.tiles
+                    else "Drop colour and normal map textures here\nor click Add…")
+            p.drawText(self.viewport().rect(), Qt.AlignmentFlag.AlignCenter, text)
+
+
+class FillButton(QPushButton):
+    """Shows a row's fill colour. The window handles clicks."""
+
+    def show_fill(self, fill, normal_map=False):
+        """Show `fill` (a tuple of 0..1 values, or None), or "Flat" for a normal map."""
+        self.setEnabled(not normal_map)
+        if normal_map:
+            self.setText("Flat")
+            self.setStyleSheet("")
+            self.setToolTip("Normal maps are flat where a part's tile has no texture")
+        elif fill is None:
+            self.setText("Empty")
+            self.setStyleSheet("")
+            self.setToolTip("Parts whose tile has no texture are left empty, and edge padding "
+                            "covers them. Click to choose a fill colour.")
+        else:
+            rgb = list(fill[:3]) if len(fill) >= 3 else [fill[0]] * 3
+            r, g, b = (round(255 * c) for c in rgb)
+            text_colour = "#000" if 0.299 * r + 0.587 * g + 0.114 * b > 140 else "#fff"
+            self.setText(", ".join(f"{c:g}" for c in fill))
+            self.setStyleSheet(f"QPushButton {{ background: rgb({r}, {g}, {b}); color: {text_colour}; }}")
+            self.setToolTip("Colour for parts whose tile has no texture. Click to change it.")
 
 
 class NoWheelComboBox(QComboBox):

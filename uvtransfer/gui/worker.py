@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 from PySide6.QtCore import QObject, Signal
 
+from .. import tiles as udims
 from ..errors import Cancelled, TransferError
 from ..transfer import Transfer
 from .preview import uv_wireframe
@@ -30,12 +31,17 @@ class Bridge(QObject):
 
 @dataclass
 class MeshLoad:
-    """Outcome of loading a source/target pair: a Transfer and wireframes, or an error."""
+    """Outcome of loading a source/target pair: a Transfer and wireframes, or an error.
+
+    `tile_wireframes` holds the source UVs of each UDIM tile, moved into 0 to 1,
+    when the source uses more than one tile.
+    """
 
     transfer: object = None
     error: str = ""
     src_wireframe: object = None
     dst_wireframe: object = None
+    tile_wireframes: dict = None
 
 
 def load_meshes(bridge, token, src_path, dst_path, uv_set):
@@ -43,8 +49,9 @@ def load_meshes(bridge, token, src_path, dst_path, uv_set):
     def work():
         try:
             xfer = Transfer.from_fbx(src_path, dst_path, uv_set)
-            result = MeshLoad(xfer, "", uv_wireframe(xfer.src.uv_edges()),
-                              uv_wireframe(xfer.dst.uv_edges()))
+            src_edges = xfer.src.uv_edges()
+            result = MeshLoad(xfer, "", uv_wireframe(src_edges), uv_wireframe(xfer.dst.uv_edges()),
+                              tile_wireframes(src_edges) if len(xfer.tiles) > 1 else {})
         except TransferError as e:
             result = MeshLoad(error=str(e))
         except Exception as e:                    # keep the UI alive; show what happened
@@ -55,13 +62,21 @@ def load_meshes(bridge, token, src_path, dst_path, uv_set):
     threading.Thread(target=work, daemon=True, name="mesh-load").start()
 
 
+def tile_wireframes(edges):
+    """{tile: wireframe of the UV edges in that tile, moved into 0 to 1}."""
+    tiles = udims.triangle_tiles(edges)           # works on edges too: the tile of each midpoint
+    local = udims.local_uv(edges, tiles)
+    return {int(t): uv_wireframe(local[tiles == t]) for t in set(tiles.tolist()) if t != udims.NO_TILE}
+
+
 @dataclass
 class Job:
-    """One texture to transfer: its table row, file and type."""
+    """One output to make: its table row, and a texture (path and type) or a `TiledMap`."""
 
     row_id: int
-    path: str
-    kind: str
+    path: str = ""
+    kind: str = ""
+    tiled: object = None
 
 
 class TransferWorker(threading.Thread):
@@ -97,8 +112,12 @@ class TransferWorker(threading.Thread):
 
         started = time.monotonic()
         try:
-            result = self.transfer.transfer_file(job.path, self.out_dir, job.kind, self.options,
-                                                 progress=progress, cancel=self._cancel.is_set)
+            if job.tiled is not None:
+                result = self.transfer.transfer_map(job.tiled, self.out_dir, self.options,
+                                                    progress=progress, cancel=self._cancel.is_set)
+            else:
+                result = self.transfer.transfer_file(job.path, self.out_dir, job.kind, self.options,
+                                                     progress=progress, cancel=self._cancel.is_set)
         except Cancelled:
             self.bridge.rowFailed.emit(job.row_id, "Cancelled", True)
             return False

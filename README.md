@@ -36,6 +36,29 @@ Edited a mesh or texture since? Press **Reload** (F5) to read everything
 again from disk; finished textures whose files changed are marked
 "File changed".
 
+### Several parts, each with its own textures
+
+Sometimes the textures come in sets: a head, teeth and eyes, each painted
+in its own 0 to 1 UV space, now packed together into one new layout. Tell
+Tomte which set each part belongs to by moving the parts into separate
+UDIM tiles in the **source** FBX: the head stays in 1001 (UVs 0 to 1), the
+teeth move one step right to 1002 (UVs 1 to 2), the eyes to 1003, and so on.
+The target FBX keeps everything in 0 to 1.
+
+The texture list then shows one row per output and a column per tile:
+
+1. Drop each part's textures onto its tile's column. Textures of the same
+   kind (colour, normal, or the same last word such as "ORM") line up in
+   the same row. Files named the UDIM way (`Body_Color.1002.png`) find
+   their own tile.
+2. Double-click an output's name to rename it.
+3. **Fill** is the colour for parts whose tile has no texture in that row
+   (or **Empty**, so edge padding covers them). Normal maps are always
+   flat there.
+
+Each tile's normal map format is detected on its own; the result uses the
+format of the largest part and converts the rest to match.
+
 ### Setups for repeat bakes
 
 **File > Save setup** (Ctrl+S) stores both meshes, the textures and their
@@ -65,6 +88,14 @@ folder can be moved or shared with the setup inside it.
 the file's; `--save-setup` writes a setup instead of transferring. From this
 folder, `python -m uvtransfer` does the same. Run with `--help` for details.
 
+For a source FBX with parts in UDIM tiles, textures named
+`Body_Color.1001.png`, `Body_Color.1002.png` ... are put together into
+`Body_Color.png`. For textures named otherwise, give each output with
+`--map` (after the FBX files):
+
+    --map Body_Color.png 1001=Head_Color.png 1002=Teeth_Color.png
+    --map Body_ORM.png 1001=Head_ORM.png fill=1,0.5,0
+
 ## Try it
 
 `samples/` has a sphere with two UV layouts and a colour and normal map made
@@ -92,7 +123,8 @@ result = xfer.transfer_file("samples/Sphere_Normal.png", "out", options=Options(
   keeps tangents consistent everywhere.
 - Tangent frames follow MikkTSpace closely but not exactly (see
   `uvtransfer/tangents.py` for the measured differences).
-- UDIM tiles aren't supported: UVs outside 0 to 1 wrap onto one texture.
+- UDIM tiles work in the source mesh (one texture per tile, see above). The
+  target is a single 0 to 1 texture: target UVs outside 0 to 1 wrap onto it.
 - 16-bit colour PNG/TIFF input needs `opencv-python-headless` for full
   precision; without it the app warns and reads 8 bits.
 
